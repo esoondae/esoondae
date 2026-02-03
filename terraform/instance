@@ -1,0 +1,48 @@
+# AWS 클라우드 컴퓨팅 인프라 프로젝트
+
+이 프로젝트는 Terraform을 사용하여 AWS에서 마이크로서비스 아키텍처를 구축하는 인프라스트럭처 코드입니다.
+
+## 아키텍처 개요
+
+- **VPC**: 3-tier 아키텍처 (Public, Private 서브넷)
+- **ECS**: 컨테이너 오케스트레이션
+- **ALB**: 애플리케이션 로드 밸런서
+- **DynamoDB**: NoSQL 데이터베이스
+- **ECR**: 컨테이너 레지스트리
+- **Bastion Host**: 보안 접근
+
+## 주요 구성 요소
+
+### 네트워크
+- VPC (10.0.0.0/16)
+- Public 서브넷 2개 (AZ-a, AZ-c)
+- Private 서브넷 2개 (AZ-a, AZ-c)
+- Internet Gateway 및 NAT Gateway
+
+### 컴퓨팅
+- ECS 클러스터
+- Bastion EC2 인스턴스 (t3.micro)
+- Application Load Balancer
+
+### 데이터베이스
+- DynamoDB 테이블 (product)
+- KMS 암호화 적용
+- Point-in-time recovery 활성화
+
+### 보안
+- Security Groups (ALB, Bastion, ECS)
+- IAM 역할 및 정책
+- KMS 키 관리
+
+## 사전 요구사항
+
+- AWS CLI 설치 및 구성
+- Terraform 설치 (v1.0+)
+- 적절한 AWS 권한
+
+## 배포 방법
+
+1. 저장소 클론
+```bash
+git clone <repository-url>
+cd <project-directory>
