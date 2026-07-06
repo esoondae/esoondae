@@ -1,0 +1,756 @@
+2026년 전국기능경기대회 클라우드컴퓨팅 3과제 AWS CLI 코드를 작성해드리겠습니다.
+
+전체 구성을 단계별로 나눠서 작성합니다.
+
+1. VPC 및 네트워크 구성
+# VPC 생성
+VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --query 'Vpc.VpcId' --output text)
+aws ec2 create-tags --resources $VPC_ID --tags Key=Name,Value=apdev-vpc
+
+# 인터넷 게이트웨이
+IGW_ID=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+
+# 퍼블릭 서브넷 2개 (EKS 노드, ALB용)
+PUB_SUB1=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 --availability-zone ap-northeast-2a --query 'Subnet.SubnetId' --output text)
+PUB_SUB2=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.2.0/24 --availability-zone ap-northeast-2c --query 'Subnet.SubnetId' --output text)
+aws ec2 create-tags --resources $PUB_SUB1 --tags Key=Name,Value=apdev-public-2a Key=kubernetes.io/role/elb,Value=1
+aws ec2 create-tags --resources $PUB_SUB2 --tags Key=Name,Value=apdev-public-2c Key=kubernetes.io/role/elb,Value=1
+
+# 프라이빗 서브넷 2개 (RDS용)
+PRI_SUB1=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.11.0/24 --availability-zone ap-northeast-2a --query 'Subnet.SubnetId' --output text)
+PRI_SUB2=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.12.0/24 --availability-zone ap-northeast-2c --query 'Subnet.SubnetId' --output text)
+aws ec2 create-tags --resources $PRI_SUB1 --tags Key=Name,Value=apdev-private-2a
+aws ec2 create-tags --resources $PRI_SUB2 --tags Key=Name,Value=apdev-private-2c
+
+# 퍼블릭 라우팅 테이블
+PUB_RT=$(aws ec2 create-route-table --vpc-id $VPC_ID --query 'RouteTable.RouteTableId' --output text)
+aws ec2 create-route --route-table-id $PUB_RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $PUB_SUB1
+aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $PUB_SUB2
+
+# NAT Gateway (EKS 노드 아웃바운드용)
+EIP=$(aws ec2 allocate-address --domain vpc --query 'AllocationId' --output text)
+NAT_GW=$(aws ec2 create-nat-gateway --subnet-id $PUB_SUB1 --allocation-id $EIP --query 'NatGateway.NatGatewayId' --output text)
+aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT_GW
+
+# 프라이빗 라우팅 테이블
+PRI_RT=$(aws ec2 create-route-table --vpc-id $VPC_ID --query 'RouteTable.RouteTableId' --output text)
+aws ec2 create-route --route-table-id $PRI_RT --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT_GW
+aws ec2 associate-route-table --route-table-id $PRI_RT --subnet-id $PRI_SUB1
+aws ec2 associate-route-table --route-table-id $PRI_RT --subnet-id $PRI_SUB2
+
+Copy
+bash
+2. 보안 그룹
+# ALB 보안 그룹
+ALB_SG=$(aws ec2 create-security-group --group-name apdev-alb-sg --description "ALB SG" --vpc-id $VPC_ID --query 'GroupId' --output text)
+aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 80 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 443 --cidr 0.0.0.0/0
+
+# EKS 노드 보안 그룹
+NODE_SG=$(aws ec2 create-security-group --group-name apdev-node-sg --description "EKS Node SG" --vpc-id $VPC_ID --query 'GroupId' --output text)
+aws ec2 authorize-security-group-ingress --group-id $NODE_SG --protocol tcp --port 8080 --source-group $ALB_SG
+aws ec2 authorize-security-group-ingress --group-id $NODE_SG --protocol -1 --port -1 --source-group $NODE_SG
+
+# RDS 보안 그룹
+RDS_SG=$(aws ec2 create-security-group --group-name apdev-rds-sg --description "RDS SG" --vpc-id $VPC_ID --query 'GroupId' --output text)
+aws ec2 authorize-security-group-ingress --group-id $RDS_SG --protocol tcp --port 3306 --source-group $NODE_SG
+
+Copy
+bash
+3. RDS 생성
+# DB 서브넷 그룹
+aws rds create-db-subnet-group \
+  --db-subnet-group-name apdev-rds-subnet-group \
+  --db-subnet-group-description "apdev RDS subnet group" \
+  --subnet-ids $PRI_SUB1 $PRI_SUB2
+
+# Multi-AZ RDS 생성
+aws rds create-db-instance \
+  --db-instance-identifier apdev-rds-instance \
+  --db-instance-class db.t3.micro \
+  --engine mysql \
+  --engine-version 8.0 \
+  --master-username admin \
+  --master-user-password <db-password> \
+  --db-name dev \
+  --allocated-storage 20 \
+  --storage-type gp3 \
+  --multi-az \
+  --no-publicly-accessible \
+  --vpc-security-group-ids $RDS_SG \
+  --db-subnet-group-name apdev-rds-subnet-group \
+  --backup-retention-period 7 \
+  --no-deletion-protection
+
+aws rds wait db-instance-available --db-instance-identifier apdev-rds-instance
+
+# RDS 엔드포인트 확인
+RDS_HOST=$(aws rds describe-db-instances \
+  --db-instance-identifier apdev-rds-instance \
+  --query 'DBInstances[0].Endpoint.Address' --output text)
+
+Copy
+bash
+4. ECR 레포지토리
+aws ecr create-repository --repository-name apdev/user --region ap-northeast-2
+aws ecr create-repository --repository-name apdev/product --region ap-northeast-2
+aws ecr create-repository --repository-name apdev/stress --region ap-northeast-2
+
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.ap-northeast-2.amazonaws.com"
+
+# ECR 로그인
+aws ecr get-login-password --region ap-northeast-2 | \
+  docker login --username AWS --password-stdin $ECR_REGISTRY
+
+Copy
+bash
+5. Docker 이미지 빌드 및 푸시
+# user 앱 Dockerfile
+cat > Dockerfile.user <<'EOF'
+FROM amazonlinux:2023
+COPY user /app/user
+RUN chmod +x /app/user
+EXPOSE 8080
+CMD ["/app/user"]
+EOF
+
+docker build -f Dockerfile.user -t $ECR_REGISTRY/apdev/user:latest .
+docker push $ECR_REGISTRY/apdev/user:latest
+
+# product 앱
+cat > Dockerfile.product <<'EOF'
+FROM amazonlinux:2023
+COPY product /app/product
+RUN chmod +x /app/product
+EXPOSE 8080
+CMD ["/app/product"]
+EOF
+
+docker build -f Dockerfile.product -t $ECR_REGISTRY/apdev/product:latest .
+docker push $ECR_REGISTRY/apdev/product:latest
+
+# stress 앱
+cat > Dockerfile.stress <<'EOF'
+FROM amazonlinux:2023
+COPY stress /app/stress
+RUN chmod +x /app/stress
+EXPOSE 8080
+CMD ["/app/stress"]
+EOF
+
+docker build -f Dockerfile.stress -t $ECR_REGISTRY/apdev/stress:latest .
+docker push $ECR_REGISTRY/apdev/stress:latest
+
+Copy
+bash
+6. EKS 클러스터 생성
+# EKS IAM 역할
+aws iam create-role --role-name apdev-eks-cluster-role \
+  --assume-role-policy-document '{
+    "Version":"2012-10-17",
+    "Statement":[{"Effect":"Allow","Principal":{"Service":"eks.amazonaws.com"},"Action":"sts:AssumeRole"}]
+  }'
+aws iam attach-role-policy --role-name apdev-eks-cluster-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+# EKS 클러스터 생성
+aws eks create-cluster \
+  --name apdev-eks \
+  --role-arn arn:aws:iam::${ACCOUNT_ID}:role/apdev-eks-cluster-role \
+  --resources-vpc-config subnetIds=${PUB_SUB1},${PUB_SUB2},securityGroupIds=${NODE_SG} \
+  --kubernetes-version 1.31
+
+aws eks wait cluster-active --name apdev-eks
+
+# kubeconfig 업데이트
+aws eks update-kubeconfig --name apdev-eks --region ap-northeast-2
+
+Copy
+bash
+7. EKS 노드 그룹
+# 노드 IAM 역할
+aws iam create-role --role-name apdev-eks-node-role \
+  --assume-role-policy-document '{
+    "Version":"2012-10-17",
+    "Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]
+  }'
+aws iam attach-role-policy --role-name apdev-eks-node-role --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+aws iam attach-role-policy --role-name apdev-eks-node-role --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+aws iam attach-role-policy --role-name apdev-eks-node-role --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+aws iam attach-role-policy --role-name apdev-eks-node-role --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+# 노드 그룹 생성 (t3.medium, 최소 리소스)
+aws eks create-nodegroup \
+  --cluster-name apdev-eks \
+  --nodegroup-name apdev-nodegroup \
+  --node-role arn:aws:iam::${ACCOUNT_ID}:role/apdev-eks-node-role \
+  --subnets $PUB_SUB1 $PUB_SUB2 \
+  --instance-types t3.medium \
+  --scaling-config minSize=2,maxSize=6,desiredSize=2 \
+  --ami-type AL2_x86_64 \
+  --disk-size 20
+
+aws eks wait nodegroup-active --cluster-name apdev-eks --nodegroup-name apdev-nodegroup
+
+Copy
+bash
+8. S3 버킷
+BUCKET_NAME="apdev-product-images-${ACCOUNT_ID}"
+
+aws s3api create-bucket \
+  --bucket $BUCKET_NAME \
+  --region ap-northeast-2 \
+  --create-bucket-configuration LocationConstraint=ap-northeast-2
+
+# 퍼블릭 액세스 차단 해제 (CloudFront OAC 사용 시 유지)
+aws s3api put-public-access-block \
+  --bucket $BUCKET_NAME \
+  --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+
+Copy
+bash
+9. CloudFront + ALB 통합 (단일 엔드포인트)
+# ALB는 EKS AWS Load Balancer Controller가 Ingress로 생성
+# CloudFront 배포 생성 (ALB origin + S3 origin)
+
+# S3 OAC 생성
+OAC_ID=$(aws cloudfront create-origin-access-control \
+  --origin-access-control-config '{
+    "Name":"apdev-s3-oac",
+    "OriginAccessControlOriginType":"s3",
+    "SigningBehavior":"always",
+    "SigningProtocol":"sigv4"
+  }' --query 'OriginAccessControl.Id' --output text)
+
+# CloudFront 배포
+CF_DIST=$(aws cloudfront create-distribution --distribution-config '{
+  "CallerReference": "apdev-cf-2026",
+  "Origins": {
+    "Quantity": 2,
+    "Items": [
+      {
+        "Id": "alb-origin",
+        "DomainName": "<ALB_DNS_NAME>",
+        "CustomOriginConfig": {
+          "HTTPPort": 80,
+          "HTTPSPort": 443,
+          "OriginProtocolPolicy": "http-only"
+        }
+      },
+      {
+        "Id": "s3-origin",
+        "DomainName": "'$BUCKET_NAME'.s3.ap-northeast-2.amazonaws.com",
+        "S3OriginConfig": {"OriginAccessIdentity": ""},
+        "OriginAccessControlId": "'$OAC_ID'"
+      }
+    ]
+  },
+  "DefaultCacheBehavior": {
+    "TargetOriginId": "alb-origin",
+    "ViewerProtocolPolicy": "redirect-to-https",
+    "AllowedMethods": {"Quantity":7,"Items":["GET","HEAD","OPTIONS","PUT","POST","PATCH","DELETE"],"CachedMethods":{"Quantity":2,"Items":["GET","HEAD"]}},
+    "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+    "OriginRequestPolicyId": "216adef6-5c7f-47e4-b989-5492eafa07d3",
+    "Compress": true
+  },
+  "CacheBehaviors": {
+    "Quantity": 1,
+    "Items": [
+      {
+        "PathPattern": "/images/*",
+        "TargetOriginId": "s3-origin",
+        "ViewerProtocolPolicy": "redirect-to-https",
+        "AllowedMethods": {"Quantity":2,"Items":["GET","HEAD"],"CachedMethods":{"Quantity":2,"Items":["GET","HEAD"]}},
+        "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+        "Compress": true
+      }
+    ]
+  },
+  "Enabled": true,
+  "HttpVersion": "http2",
+  "PriceClass": "PriceClass_200",
+  "WebACLId": "<WAF_ACL_ARN>"
+}' --query 'Distribution.DomainName' --output text)
+
+echo "CloudFront endpoint: https://$CF_DIST"
+
+
+Copy
+10. WAF 설정 (비정상 요청 차단)
+# WAF WebACL 생성 (CloudFront용 - us-east-1)
+aws wafv2 create-web-acl \
+  --name apdev-waf \
+  --scope CLOUDFRONT \
+  --region us-east-1 \
+  --default-action Allow={} \
+  --rules '[
+    {
+      "Name": "BlockSQLInjection",
+      "Priority": 1,
+      "Statement": {
+        "ManagedRuleGroupStatement": {
+          "VendorName": "AWS",
+          "Name": "AWSManagedRulesSQLiRuleSet"
+        }
+      },
+      "OverrideAction": {"None": {}},
+      "VisibilityConfig": {
+        "SampledRequestsEnabled": true,
+        "CloudWatchMetricsEnabled": true,
+        "MetricName": "SQLiRule"
+      }
+    },
+    {
+      "Name": "BlockCommonAttacks",
+      "Priority": 2,
+      "Statement": {
+        "ManagedRuleGroupStatement": {
+          "VendorName": "AWS",
+          "Name": "AWSManagedRulesCommonRuleSet"
+        }
+      },
+      "OverrideAction": {"None": {}},
+      "VisibilityConfig": {
+        "SampledRequestsEnabled": true,
+        "CloudWatchMetricsEnabled": true,
+        "MetricName": "CommonRule"
+      }
+    }
+  ]' \
+  --visibility-config SampledRequestsEnabled=true,CloudWatchMetricsEnabled=true,MetricName=apdev-waf
+
+
+Copy
+bash
+11. EKS Kubernetes 리소스 배포
+# AWS Load Balancer Controller 설치
+helm repo add eks https://aws.github.io/eks-charts
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=apdev-eks \
+  --set serviceAccount.create=true \
+  --set region=ap-northeast-2 \
+  --set vpcId=$VPC_ID
+
+Copy
+bash
+# namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apdev
+---
+# user Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secret
+  namespace: apdev
+stringData:
+  MYSQL_USER: "admin"
+  MYSQL_PASSWORD: "<db-password>"
+  MYSQL_HOST: "<RDS_HOST>"
+  MYSQL_PORT: "3306"
+  MYSQL_DBNAME: "dev"
+---
+# user Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user
+  namespace: apdev
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: user
+  template:
+    metadata:
+      labels:
+        app: user
+    spec:
+      containers:
+      - name: user
+        image: <ACCOUNT_ID>.dkr.ecr.ap-northeast-2.amazonaws.com/apdev/user:latest
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - secretRef:
+            name: db-secret
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-svc
+  namespace: apdev
+spec:
+  selector:
+    app: user
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# product Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product
+  namespace: apdev
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: product
+  template:
+    metadata:
+      labels:
+        app: product
+    spec:
+      containers:
+      - name: product
+        image: <ACCOUNT_ID>.dkr.ecr.ap-northeast-2.amazonaws.com/apdev/product:latest
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - secretRef:
+            name: db-secret
+        env:
+        - name: S3_BUCKET
+          value: "<BUCKET_NAME>"
+        - name: AWS_REGION
+          value: "ap-northeast-2"
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-svc
+  namespace: apdev
+spec:
+  selector:
+    app: product
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# stress Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stress
+  namespace: apdev
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: stress
+  template:
+    metadata:
+      labels:
+        app: stress
+    spec:
+      containers:
+      - name: stress
+        image: <ACCOUNT_ID>.dkr.ecr.ap-northeast-2.amazonaws.com/apdev/stress:latest
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stress-svc
+  namespace: apdev
+spec:
+  selector:
+    app: stress
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# ALB Ingress (단일 엔드포인트)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: apdev-ingress
+  namespace: apdev
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/subnets: <PUB_SUB1>,<PUB_SUB2>
+    alb.ingress.kubernetes.io/security-groups: <ALB_SG>
+    alb.ingress.kubernetes.io/healthcheck-path: /healthcheck
+    alb.ingress.kubernetes.io/actions.return-404: >
+      {"type":"fixed-response","fixedResponseConfig":{"contentType":"application/json","statusCode":"404","messageBody":"{\"message\":\"Not Found\"}"}}
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /v1/user
+        pathType: Prefix
+        backend:
+          service:
+            name: user-svc
+            port:
+              number: 8080
+      - path: /v1/product
+        pathType: Prefix
+        backend:
+          service:
+            name: product-svc
+            port:
+              number: 8080
+      - path: /v1/stress
+        pathType: Prefix
+        backend:
+          service:
+            name: stress-svc
+            port:
+              number: 8080
+      - path: /healthcheck
+        pathType: Exact
+        backend:
+          service:
+            name: user-svc
+            port:
+              number: 8080
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: return-404
+            port:
+              number: use-annotation
+---
+# HPA - user
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: user-hpa
+  namespace: apdev
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: user
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+---
+# HPA - product
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: product-hpa
+  namespace: apdev
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: product
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+---
+# HPA - stress
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: stress-hpa
+  namespace: apdev
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: stress
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+
+
+Copy
+12. RDS 테이블 생성 및 데이터 삽입
+# 테이블 생성
+mysql -h $RDS_HOST -u admin -p<db-password> dev <<'EOF'
+CREATE TABLE IF NOT EXISTS user (
+    id        VARCHAR(255) NOT NULL,
+    username  VARCHAR(255) NOT NULL,
+    email     VARCHAR(255) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_username (username)
+);
+
+CREATE TABLE IF NOT EXISTS product (
+    id         VARCHAR(255) NOT NULL,
+    name       VARCHAR(255) NOT NULL,
+    price      FLOAT(8)     NOT NULL,
+    image_path VARCHAR(500) DEFAULT NULL,
+    PRIMARY KEY (id)
+);
+
+-- 성능 최적화 인덱스 (email 조회 빈번)
+CREATE INDEX idx_user_email ON user(email);
+EOF
+
+# 덤프 데이터 삽입
+mysql -h $RDS_HOST -u admin -p<db-password> dev < load_user.dump
+
+Copy
+bash
+13. S3 버킷 정책 (CloudFront OAC)
+aws s3api put-bucket-policy --bucket $BUCKET_NAME --policy '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontOAC",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudfront.amazonaws.com"
+      },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::'$BUCKET_NAME'/*",
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "arn:aws:cloudfront::'$ACCOUNT_ID':distribution/<CF_DIST_ID>"
+        }
+      }
+    }
+  ]
+}'
+
+Copy
+bash
+14. CloudWatch 모니터링
+# EKS Container Insights 활성화
+aws eks create-addon \
+  --cluster-name apdev-eks \
+  --addon-name amazon-cloudwatch-observability \
+  --region ap-northeast-2
+
+# SLO 알람 - user 응답시간 0.2초 초과
+aws cloudwatch put-metric-alarm \
+  --alarm-name apdev-user-latency-slo \
+  --metric-name TargetResponseTime \
+  --namespace AWS/ApplicationELB \
+  --dimensions Name=LoadBalancer,Value=<ALB_ARN_SUFFIX> \
+  --statistic p99 \
+  --period 60 \
+  --threshold 0.2 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 3 \
+  --alarm-actions <SNS_ARN>
+
+# SLO 알람 - stress 응답시간 1초 초과
+aws cloudwatch put-metric-alarm \
+  --alarm-name apdev-stress-latency-slo \
+  --metric-name TargetResponseTime \
+  --namespace AWS/ApplicationELB \
+  --statistic p99 \
+  --period 60 \
+  --threshold 1.0 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 3 \
+  --alarm-actions <SNS_ARN>
+
+# RDS CPU 알람
+aws cloudwatch put-metric-alarm \
+  --alarm-name apdev-rds-cpu \
+  --metric-name CPUUtilization \
+  --namespace AWS/RDS \
+  --dimensions Name=DBInstanceIdentifier,Value=apdev-rds-instance \
+  --statistic Average \
+  --period 60 \
+  --threshold 80 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 2 \
+  --alarm-actions <SNS_ARN>
+
+
+Copy
+bash
+15. EKS Cluster Autoscaler
+helm repo add autoscaler https://kubernetes.github.io/autoscaler
+helm install cluster-autoscaler autoscaler/cluster-autoscaler \
+  --namespace kube-system \
+  --set autoDiscovery.clusterName=apdev-eks \
+  --set awsRegion=ap-northeast-2 \
+  --set rbac.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::${ACCOUNT_ID}:role/apdev-cluster-autoscaler-role
+
+Copy
+bash
+주요 구성 요약:
+
+단일 엔드포인트: CloudFront → ALB(EKS Ingress) 경로로 /v1/* 처리, /images/*는 S3로 라우팅
+
+WAF: CloudFront에 연결하여 비정상
